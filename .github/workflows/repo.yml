@@ -1,13 +1,13 @@
-name: repo
+name: pacman-repo
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - "packages/**"
-      - ".github/workflows/repo.yml"
+      - 'packages/**'
+      - '.github/workflows/pacman-repo.yml'
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: '0 3 * * *'
 
 jobs:
   build:
@@ -16,72 +16,75 @@ jobs:
       contents: write
     env:
       REPO_BRANCH: repo
-      REPO_DIR: repo         # workspace dir holding built db+pkgs
+      REPO_DIR: repo
       ARCH: x86_64
       DBNAME: custom
+
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Detect changed package dirs
         id: changes
-        run: |
-          base_ref="${{ github.event.before || 'HEAD~1' }}"
-          set -e
-          # List dirs under packages/ that changed PKGBUILD (fallback to all if unknown)
-          if git cat-file -e "$base_ref^{commit}" 2>/dev/null; then
-            mapfile -t DIRS < <(git diff --name-only "$base_ref" "$GITHUB_SHA" -- 'packages/**/PKGBUILD' \
-              | sed -E 's#/PKGBUILD$##' | sort -u)
-          else
-            mapfile -t DIRS < <(find packages -mindepth 1 -maxdepth 1 -type d | sort)
-          fi
-          if (( ${#DIRS[@]} == 0 )); then
-            echo "nothing to build" | tee /tmp/nothing
-          else
-            printf '%s\n' "${DIRS[@]}" | tee /tmp/dirs
-          fi
-
-      - name: Early exit if nothing changed
-        if: ${{ hashFiles('/tmp/nothing') != '' }}
-        run: echo "No PKGBUILD changes."
-
-      - name: Build changed packages
-        if: ${{ hashFiles('/tmp/nothing') == '' }}
-        id: build
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$REPO_DIR/$ARCH"
-          while read -r d; do
-            echo "==> Building $d"
-            paths=$(./scripts/build-one.sh "$d" "$ARCH")
-            for p in $paths; do
-              cp -v "$p" "$REPO_DIR/$ARCH/"
-            done
-          done < /tmp/dirs
+          base_ref="${{ github.event.before }}"
+          if ! git cat-file -e "${base_ref}^{commit}" 2>/dev/null; then
+            mapfile -t DIRS < <(find packages -mindepth 1 -maxdepth 1 -type d | sort)
+          else
+            mapfile -t DIRS < <(git diff --name-only "$base_ref" "$GITHUB_SHA" -- 'packages/**/PKGBUILD' | sed -E 's#/PKGBUILD$##' | sort -u)
+            [[ ${#DIRS[@]} -gt 0 ]] || mapfile -t DIRS < <(find packages -mindepth 1 -maxdepth 1 -type d | sort)
+          fi
+          printf '%s\n' "${DIRS[@]}" > changed_dirs.txt
+          echo "has_changes=$([[ -s changed_dirs.txt ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          cat changed_dirs.txt || true
 
       - name: Fetch existing repo branch
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
         run: |
+          set -euo pipefail
           git fetch origin "${REPO_BRANCH}:${REPO_BRANCH}" || true
           mkdir -p "$REPO_DIR/$ARCH"
-          # Pull existing packages/db so repo-add is incremental
           if git rev-parse --verify "${REPO_BRANCH}" >/dev/null 2>&1; then
             git worktree add wt "${REPO_BRANCH}"
-            rsync -a --delete wt/ "$REPO_DIR/"
+            rsync -a wt/ "$REPO_DIR/"
             git worktree remove wt --force
           fi
 
-      - name: Generate repo database
-        if: ${{ hashFiles('/tmp/nothing') == '' }}
+      - name: Build packages
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
         run: |
-          docker run --rm -v "$PWD/$REPO_DIR":/repo archlinux:base-devel bash -lc '
+          set -euo pipefail
+          while read -r d; do
+            echo "::group::build $d"
+            rm -f "$d"/*.pkg.tar.* || true
+            docker run --rm -v "$PWD/$d":/src -w /src archlinux:base-devel bash -lc '
+              set -euo pipefail
+              pacman -Syu --noconfirm git base-devel sudo
+              useradd -m builder
+              chown -R builder:builder /src
+              sudo -u builder bash -lc "makepkg -sCfr --noconfirm"
+            '
+            cp -v "$d"/*.pkg.tar.zst "$REPO_DIR/$ARCH/"
+            echo "::endgroup::"
+          done < changed_dirs.txt
+
+      - name: Update repo database
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/$REPO_DIR/$ARCH":/repo archlinux:base-devel bash -lc '
             pacman -Syu --noconfirm pacman
-            cd /repo/'"$ARCH"'
+            cd /repo
             repo-add '"$DBNAME"'.db.tar.gz ./*.pkg.tar.zst
           '
 
       - name: Publish repo branch
-        if: ${{ hashFiles('/tmp/nothing') == '' }}
+        if: steps.changes.outputs.has_changes == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           publish_branch: ${{ env.REPO_BRANCH }}
