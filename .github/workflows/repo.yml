@@ -54,23 +54,28 @@ jobs:
           fi
 
       - name: Build packages
-        if: steps.changes.outputs.has_changes == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          while read -r d; do
-            echo "::group::build $d"
-            rm -f "$d"/*.pkg.tar.* || true
-            docker run --rm -v "$PWD/$d":/src -w /src archlinux:base-devel bash -lc '
-              set -euo pipefail
-              pacman -Syu --noconfirm git base-devel sudo
-              useradd -m builder
-              chown -R builder:builder /src
-              sudo -u builder bash -lc "makepkg -sCfr --noconfirm"
-            '
-            cp -v "$d"/*.pkg.tar.zst "$REPO_DIR/$ARCH/"
-            echo "::endgroup::"
-          done < changed_dirs.txt
+  if: steps.changes.outputs.has_changes == 'true'
+  shell: bash
+  run: |
+    set -euo pipefail
+    mkdir -p "$REPO_DIR/$ARCH"
+    while read -r d; do
+      echo "::group::build $d"
+      rm -f "$d"/*.pkg.tar.* || true
+      docker run --rm -v "$PWD/$d":/src -w /src archlinux:base-devel bash -lc '
+        set -euo pipefail
+        pacman -Syu --noconfirm git base-devel sudo
+        id -u builder &>/dev/null || useradd -m builder
+        chown -R builder:builder /src
+        # allow makepkg to install deps without TTY/password
+        echo "builder ALL=(ALL) NOPASSWD: /usr/bin/pacman" >/etc/sudoers.d/builder
+        chmod 440 /etc/sudoers.d/builder
+        sudo -u builder bash -lc "makepkg -sCfr --noconfirm"
+      '
+      cp -v "$d"/*.pkg.tar.zst "$REPO_DIR/$ARCH/"
+      echo "::endgroup::"
+    done < changed_dirs.txt
+
 
       - name: Update repo database
         if: steps.changes.outputs.has_changes == 'true'
