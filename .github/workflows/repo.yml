@@ -1,7 +1,7 @@
 name: repo
 on:
   push:
-    branches: [ main ]
+    branches: [ aur ]
     paths:
       - "packages/**"
       - ".github/workflows/repo.yml"
