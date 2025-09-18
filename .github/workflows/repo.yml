@@ -1,23 +1,16 @@
-# .github/workflows/repo.yml
-name: repo
+name: pacman-repo
 on:
   push:
-    branches: [ aur ]
+    branches: [main]
     paths:
-      - "packages/**"
-      - "scripts/**"
-      - ".github/workflows/repo.yml"
+      - 'packages/**'
+      - '.github/workflows/pacman-repo.yml'
   workflow_dispatch:
-    inputs:
-      rebuild_all:
-        description: "Rebuild all packages"
-        required: false
-        default: "false"
   schedule:
-    - cron: "0 3 * * *"
+    - cron: '0 3 * * *'
 
 jobs:
-  build-repo:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -26,52 +19,26 @@ jobs:
       REPO_DIR: repo
       ARCH: x86_64
       DBNAME: custom
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
       - name: Detect changed package dirs
         id: changes
         shell: bash
         run: |
           set -euo pipefail
-
-          # Determine base ref
-          base_ref="${{ github.event.before || '' }}"
-          if [[ -z "${base_ref}" ]] || ! git cat-file -e "${base_ref}^{commit}" 2>/dev/null; then
-            # First push or unknown 'before': use previous commit if exists, else none
-            if git rev-parse HEAD^ >/dev/null 2>&1; then
-              base_ref="$(git rev-parse HEAD^)"
-            else
-              base_ref=""
-            fi
-          fi
-
-          # Decide whether to rebuild all
-          REBUILD_ALL="${{ github.event.inputs.rebuild_all || 'false' }}"
-          if [[ "${REBUILD_ALL}" == "true" || -z "${base_ref}" ]]; then
+          base_ref="${{ github.event.before }}"
+          if ! git cat-file -e "${base_ref}^{commit}" 2>/dev/null; then
             mapfile -t DIRS < <(find packages -mindepth 1 -maxdepth 1 -type d | sort)
           else
-            mapfile -t DIRS < <(
-              git diff --name-only "${base_ref}" "$GITHUB_SHA" -- 'packages/**/PKGBUILD' \
-              | sed -E 's#/PKGBUILD$##' | sort -u
-            )
-            # Fallback: if no PKGBUILD changed, exit early
-            if (( ${#DIRS[@]} == 0 )); then
-              echo "has_changes=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            mapfile -t DIRS < <(git diff --name-only "$base_ref" "$GITHUB_SHA" -- 'packages/**/PKGBUILD' | sed -E 's#/PKGBUILD$##' | sort -u)
+            [[ ${#DIRS[@]} -gt 0 ]] || mapfile -t DIRS < <(find packages -mindepth 1 -maxdepth 1 -type d | sort)
           fi
-
           printf '%s\n' "${DIRS[@]}" > changed_dirs.txt
-          echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          echo "Changed dirs:"; cat changed_dirs.txt
-
-      - name: Exit if nothing to build
-        if: steps.changes.outputs.has_changes != 'true'
-        run: echo "No PKGBUILD changes."
+          echo "has_changes=$([[ -s changed_dirs.txt ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          cat changed_dirs.txt || true
 
       - name: Fetch existing repo branch
         if: steps.changes.outputs.has_changes == 'true'
@@ -82,47 +49,37 @@ jobs:
           mkdir -p "$REPO_DIR/$ARCH"
           if git rev-parse --verify "${REPO_BRANCH}" >/dev/null 2>&1; then
             git worktree add wt "${REPO_BRANCH}"
-            rsync -a --delete wt/ "$REPO_DIR/"
+            rsync -a wt/ "$REPO_DIR/"
             git worktree remove wt --force
           fi
 
-      - name: Build changed packages
+      - name: Build packages
         if: steps.changes.outputs.has_changes == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$REPO_DIR/$ARCH"
           while read -r d; do
-            [[ -z "$d" ]] && continue
-            echo "==> Building $d"
-            # Clean possible leftovers
+            echo "::group::build $d"
             rm -f "$d"/*.pkg.tar.* || true
-            rm -rf "$d/src" "$d/pkg" || true
-
-            # Build inside Arch container as non-root
             docker run --rm -v "$PWD/$d":/src -w /src archlinux:base-devel bash -lc '
               set -euo pipefail
-              pacman -Syu --noconfirm git base-devel
-              id builder &>/dev/null || useradd -m builder
+              pacman -Syu --noconfirm git base-devel sudo
+              useradd -m builder
               chown -R builder:builder /src
               sudo -u builder bash -lc "makepkg -sCfr --noconfirm"
             '
-
-            # Copy built packages into repo workspace
-            find "$d" -maxdepth 1 -type f -name "*.pkg.tar.zst" -print0 | xargs -0 -I{} cp -v "{}" "$REPO_DIR/$ARCH/"
+            cp -v "$d"/*.pkg.tar.zst "$REPO_DIR/$ARCH/"
+            echo "::endgroup::"
           done < changed_dirs.txt
 
-      - name: Generate repo database
+      - name: Update repo database
         if: steps.changes.outputs.has_changes == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/$REPO_DIR":/repo archlinux:base-devel bash -lc '
-            set -euo pipefail
+          docker run --rm -v "$PWD/$REPO_DIR/$ARCH":/repo archlinux:base-devel bash -lc '
             pacman -Syu --noconfirm pacman
-            cd /repo/'"$ARCH"'
-            # Remove stale package files not present in workspace (optional prune)
-            # ls -1 *.pkg.tar.zst 2>/dev/null || true
+            cd /repo
             repo-add '"$DBNAME"'.db.tar.gz ./*.pkg.tar.zst
           '
 
