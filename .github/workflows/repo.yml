@@ -1,16 +1,23 @@
+# .github/workflows/repo.yml
 name: repo
 on:
   push:
     branches: [ aur ]
     paths:
       - "packages/**"
+      - "scripts/**"
       - ".github/workflows/repo.yml"
   workflow_dispatch:
+    inputs:
+      rebuild_all:
+        description: "Rebuild all packages"
+        required: false
+        default: "false"
   schedule:
     - cron: "0 3 * * *"
 
 jobs:
-  build:
+  build-repo:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -20,68 +27,107 @@ jobs:
       ARCH: x86_64
       DBNAME: custom
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Detect changed package dirs
         id: changes
-        run: |
-          base_ref="${{ github.event.before || 'HEAD~1' }}"
-          set -e
-          # List dirs under packages/ that changed PKGBUILD (fallback to all if unknown)
-          if git cat-file -e "$base_ref^{commit}" 2>/dev/null; then
-            mapfile -t DIRS < <(git diff --name-only "$base_ref" "$GITHUB_SHA" -- 'packages/**/PKGBUILD' \
-              | sed -E 's#/PKGBUILD$##' | sort -u)
-          else
-            mapfile -t DIRS < <(find packages -mindepth 1 -maxdepth 1 -type d | sort)
-          fi
-          if (( ${#DIRS[@]} == 0 )); then
-            echo "nothing to build" | tee /tmp/nothing
-          else
-            printf '%s\n' "${DIRS[@]}" | tee /tmp/dirs
-          fi
-
-      - name: Early exit if nothing changed
-        if: ${{ hashFiles('/tmp/nothing') != '' }}
-        run: echo "No PKGBUILD changes."
-
-      - name: Build changed packages
-        if: ${{ hashFiles('/tmp/nothing') == '' }}
-        id: build
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$REPO_DIR/$ARCH"
-          while read -r d; do
-            echo "==> Building $d"
-            paths=$(./scripts/build-one.sh "$d" "$ARCH")
-            for p in $paths; do
-              cp -v "$p" "$REPO_DIR/$ARCH/"
-            done
-          done < /tmp/dirs
+
+          # Determine base ref
+          base_ref="${{ github.event.before || '' }}"
+          if [[ -z "${base_ref}" ]] || ! git cat-file -e "${base_ref}^{commit}" 2>/dev/null; then
+            # First push or unknown 'before': use previous commit if exists, else none
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              base_ref="$(git rev-parse HEAD^)"
+            else
+              base_ref=""
+            fi
+          fi
+
+          # Decide whether to rebuild all
+          REBUILD_ALL="${{ github.event.inputs.rebuild_all || 'false' }}"
+          if [[ "${REBUILD_ALL}" == "true" || -z "${base_ref}" ]]; then
+            mapfile -t DIRS < <(find packages -mindepth 1 -maxdepth 1 -type d | sort)
+          else
+            mapfile -t DIRS < <(
+              git diff --name-only "${base_ref}" "$GITHUB_SHA" -- 'packages/**/PKGBUILD' \
+              | sed -E 's#/PKGBUILD$##' | sort -u
+            )
+            # Fallback: if no PKGBUILD changed, exit early
+            if (( ${#DIRS[@]} == 0 )); then
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          printf '%s\n' "${DIRS[@]}" > changed_dirs.txt
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "Changed dirs:"; cat changed_dirs.txt
+
+      - name: Exit if nothing to build
+        if: steps.changes.outputs.has_changes != 'true'
+        run: echo "No PKGBUILD changes."
 
       - name: Fetch existing repo branch
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
         run: |
+          set -euo pipefail
           git fetch origin "${REPO_BRANCH}:${REPO_BRANCH}" || true
           mkdir -p "$REPO_DIR/$ARCH"
-          # Pull existing packages/db so repo-add is incremental
           if git rev-parse --verify "${REPO_BRANCH}" >/dev/null 2>&1; then
             git worktree add wt "${REPO_BRANCH}"
             rsync -a --delete wt/ "$REPO_DIR/"
             git worktree remove wt --force
           fi
 
-      - name: Generate repo database
-        if: ${{ hashFiles('/tmp/nothing') == '' }}
+      - name: Build changed packages
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p "$REPO_DIR/$ARCH"
+          while read -r d; do
+            [[ -z "$d" ]] && continue
+            echo "==> Building $d"
+            # Clean possible leftovers
+            rm -f "$d"/*.pkg.tar.* || true
+            rm -rf "$d/src" "$d/pkg" || true
+
+            # Build inside Arch container as non-root
+            docker run --rm -v "$PWD/$d":/src -w /src archlinux:base-devel bash -lc '
+              set -euo pipefail
+              pacman -Syu --noconfirm git base-devel
+              id builder &>/dev/null || useradd -m builder
+              chown -R builder:builder /src
+              sudo -u builder bash -lc "makepkg -sCfr --noconfirm"
+            '
+
+            # Copy built packages into repo workspace
+            find "$d" -maxdepth 1 -type f -name "*.pkg.tar.zst" -print0 | xargs -0 -I{} cp -v "{}" "$REPO_DIR/$ARCH/"
+          done < changed_dirs.txt
+
+      - name: Generate repo database
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           docker run --rm -v "$PWD/$REPO_DIR":/repo archlinux:base-devel bash -lc '
+            set -euo pipefail
             pacman -Syu --noconfirm pacman
             cd /repo/'"$ARCH"'
+            # Remove stale package files not present in workspace (optional prune)
+            # ls -1 *.pkg.tar.zst 2>/dev/null || true
             repo-add '"$DBNAME"'.db.tar.gz ./*.pkg.tar.zst
           '
 
       - name: Publish repo branch
-        if: ${{ hashFiles('/tmp/nothing') == '' }}
+        if: steps.changes.outputs.has_changes == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           publish_branch: ${{ env.REPO_BRANCH }}
