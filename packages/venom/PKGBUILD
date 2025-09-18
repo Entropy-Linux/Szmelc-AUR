@@ -1,0 +1,15 @@
+# Maintainer: Szmelc.INC <serainox@gmail.com>
+pkgname=venom
+pkgver=1.0
+pkgrel=1
+pkgdesc="Venom - Python Venv Helper / Watchdog"
+arch=('any')
+url="https://github.com/Szmelc-INC/Venom"
+license=('GPL3')
+depends=('bash' 'python')
+source=("venom.sh::https://raw.githubusercontent.com/Szmelc-INC/Venom/main/venv.sh")
+md5sums=('SKIP')
+
+package() {
+    install -Dm755 "$srcdir/venom.sh" "$pkgdir/usr/bin/venv"
+}
