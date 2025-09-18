@@ -1,4 +1,5 @@
 name: pacman-repo
+
 on:
   push:
     branches: [main]
@@ -6,15 +7,22 @@ on:
   workflow_dispatch:
     inputs:
       rebuild_all:
+        description: Rebuild all packages
         type: boolean
         default: false
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 3 * * *' # daily regen
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pacman-repo-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions: { contents: write }
     env:
       REPO_BRANCH: repo
       REPO_DIR: repo
@@ -36,7 +44,7 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: detect-dirs
+      - name: detect package dirs
         id: changes
         shell: bash
         run: |
@@ -62,11 +70,11 @@ jobs:
           [[ -s changed_dirs.txt ]] && echo "has_changes=true" >> "$GITHUB_OUTPUT" || echo "has_changes=false" >> "$GITHUB_OUTPUT"
           cat changed_dirs.txt || true
 
-      - name: no-op
+      - name: exit if nothing to build
         if: steps.changes.outputs.has_changes != 'true'
         run: echo "No package changes."
 
-      - name: pull-existing-repo
+      - name: hydrate existing repo (if any)
         if: steps.changes.outputs.has_changes == 'true' && steps.repobr.outputs.exists == 'true'
         shell: bash
         run: |
@@ -75,7 +83,7 @@ jobs:
           rsync -a --delete wt/ "$REPO_DIR/"
           git worktree remove wt --force
 
-      - name: build
+      - name: build packages
         if: steps.changes.outputs.has_changes == 'true'
         shell: bash
         run: |
@@ -107,10 +115,13 @@ jobs:
             repo-add '"$DBNAME"'.db.tar.gz ./*.pkg.tar.zst
           '
 
-      - name: publish
+      - name: publish repo branch
         if: steps.changes.outputs.has_changes == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_branch: ${{ env.REPO_BRANCH }}
           publish_dir: ${{ env.REPO_DIR }}
           force_orphan: true
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
