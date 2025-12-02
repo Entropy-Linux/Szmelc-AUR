@@ -1,19 +1,26 @@
 # Szmelc-AUR
 Szmelc Arch repository for pacman
 
-## Add Szmelc repo
+---
+
+# Setup
+## One-liner command
 ```bash
-sudo -s
-cat > /tmp/szmelc-aur.conf <<EOF
+echo -e "[szmelc]\nSigLevel = Optional TrustAll\nServer = https://packages.szmelc.com/x86_64" | sudo tee -a /etc/pacman.conf >/dev/null && sudo pacman -Sy && sudo pacman -Sl szmelc
+```
+
+## Script
+```bash
+#!/bin/bash
+[ "$EUID" -ne 0 ] && exec sudo "$0"
+
+cat >> /etc/pacman.conf <<EOF
 
 [szmelc]
 SigLevel = Optional TrustAll
 Server = https://packages.szmelc.com/x86_64
 EOF
 
-cat /tmp/szmelc-aur.conf >> /etc/pacman.conf
-rm /tmp/szmelc-aur.conf
 pacman -Sy
 pacman -Sl szmelc
-exit
 ```
